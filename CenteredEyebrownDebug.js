@@ -10,7 +10,7 @@ const Diagnostics = require('Diagnostics');
 // Declared constant and variables //
 //================================================================================//
 const face = FaceTracking.face(0);
-const eyebrows = Scene.root.find('eyebrows');
+const eyebrowns = Scene.root.find('eyebrowns');
 //================================================================================//
 
 //================================================================================//
@@ -30,5 +30,5 @@ Diagnostics.watch("eyebrownLeft - ", eyebrownLeft)
 //================================================================================//
 // Sync the desired Obj with the movement of the right eyebrown //
 //================================================================================//
-eyebrows.transform.y = eyebrownRight;
+eyebrowns.transform.y = eyebrownRight;
 //================================================================================//
