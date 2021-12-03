@@ -1,0 +1,197 @@
+
+const Time = require('Time');
+const Patches = require('Patches');
+const Reactive = require('Reactive');
+const Multipeer = require('Multipeer');
+const Diagnostics = require('Diagnostics');
+const Participants = require('Participants');
+
+const minTurnCount = 2;
+const maxTurnCount = 4;
+
+var burstCountdown = 0;
+var curPlayer = 0; //the current person to blow up the balloon
+var activeParticipants = []; //list of all callers currently in the effect
+
+//for setting the randomized amount to burst the balloon for all callers
+const burstAmtChannel = Multipeer.getMessageChannel('BurstAmt');
+//for choosing the next player and inflating the balloon for all callers 
+const inflateChannel = Multipeer.getMessageChannel('InflateChannel');
+// for communicating about turn progression
+const turnChannel = Multipeer.getMessageChannel('TurnChannel');
+
+(async function () {
+    const self = await Participants.self;
+    const participants = await Participants.getAllOtherParticipants();
+
+    // Event for when a user successfully executes the inflate gesture
+    const onInflateGesture = await Patches.outputs.getPulse('onInflateGesture');
+    // Event for when the balloon starts to float off the screen
+    const balloonExitPulseRequest = await Patches.outputs.getPulse('balloonExit');
+
+    // Add self to participants array, since it only has other participants
+    participants.push(self);
+
+    // Add a callback for whenever a participant enters or leaves the effect
+    participants.forEach(function(participant) {
+        participant.isActiveInSameEffect.monitor({fireOnInitialValue: true}).subscribeWithSnapshot({
+            userIndex: participants.indexOf(participant),
+        }, function(event, snapshot) {
+            let participant = participants[snapshot.userIndex];
+            OnUserEnterOrLeave(event.newValue, participant);
+        });
+        activeParticipants.push(participant);
+    });
+    
+    // Add the same 'enter/leave effect' callback to new call joiners
+    Participants.onOtherParticipantAdded().subscribe(function(participant) {
+        participants.push(participant);
+        participant.isActiveInSameEffect.monitor({fireOnInitialValue: true}).subscribeWithSnapshot({
+            userIndex: participants.indexOf(participant),
+        }, function(event, snapshot) {
+            let participant = participants[snapshot.userIndex];
+            OnUserEnterOrLeave(event.newValue, participant);
+        });
+    });
+
+    SortActiveParticipantList();
+
+    // Set first player and set the randomized balloon burst number for all callers
+    if (activeParticipants[curPlayer] === self) {
+        SetBurstAmount();
+        Patches.inputs.setBoolean('currentPlayer', true);
+        Patches.inputs.setPulse('enterBalloon', Reactive.once());
+    }
+    // Randomly choose a color for each user's balloon
+    Patches.inputs.setScalar('balloonColor', Math.floor(Math.random() * 3));
+
+    /////////////// MESSAGING CALLBACKS ///////////////
+    // Message recieved, set the new burst number from the message  
+    burstAmtChannel.onMessage.subscribe((burst) => {
+        Patches.inputs.setPulse('resetBalloon', Reactive.once());
+        burstCountdown = burst.burstNum;
+    });
+
+    // Message recieved, set new curPlayer from the message and start turn if it's me
+    turnChannel.onMessage.subscribe((msg) => {
+        curPlayer = msg.turn;
+
+        if (activeParticipants[curPlayer] === self) {
+            Patches.inputs.setBoolean('currentPlayer', true);
+            Patches.inputs.setPulse('enterBalloon', Reactive.once());
+        } else {
+            Patches.inputs.setBoolean('currentPlayer', false);
+        }
+    });
+
+    // Message recieved, inflate balloon one step and decrement turn countdown
+    inflateChannel.onMessage.subscribe(() => {
+        Patches.inputs.setPulse('inflateBalloon', Reactive.once());
+        burstCountdown--;
+    });
+
+    /////////////// PATCH EVENT CALLBACKS ///////////////
+    // Play ballooon exit animation 
+    balloonExitPulseRequest.subscribe( function(e) {
+        Patches.inputs.setBoolean('currentPlayer', false);
+        Patches.inputs.setPulse('exitBalloon', Reactive.once());  
+        // Inflate the balloon for all callers 
+        inflateChannel.sendMessage({}).catch(err => {
+            Diagnostics.log(err);
+        });
+
+        // Wait 3 seconds till the float animation is complete before passing turn
+        Time.setTimeout(() => {
+            curPlayer = (curPlayer + 1) % activeParticipants.length;
+
+            turnChannel.sendMessage({ "turn": curPlayer }).catch(err => {
+                Diagnostics.log(err);
+            });
+        }, 3000);
+    });
+
+    // Every time we inflate, check if we burst the balloon
+    onInflateGesture.subscribe( function() {
+        burstCountdown--;
+        if(burstCountdown === 0) {
+            EndRound();
+        } else {
+            Patches.inputs.setPulse('inflateBalloon', Reactive.once());
+        }
+    });
+
+    /////////////// HELPER FUNCTIONS ///////////////
+    // Reset the experience when the round ends
+    function EndRound() {
+        Patches.inputs.setBoolean('currentPlayer', false);
+        Patches.inputs.setPulse('burstBalloon', Reactive.once());
+        SetBurstAmount();
+        
+        // Tell everyone whose turn is next, after our burst animation is complete
+        Time.setTimeout(() => {
+            curPlayer = (curPlayer + 1) % activeParticipants.length;
+
+            turnChannel.sendMessage({ "turn": curPlayer }).catch(err => {
+                Diagnostics.log(err);
+            });
+        }, 2000);
+    }
+
+    // Called whenever a user enters or leaves the effect
+    // User joined: isActive == true, User left: isActive == false
+    function OnUserEnterOrLeave(isActive, participant) {
+        if (isActive) {
+            if (!activeParticipants.includes(participant)) {
+                let previousParticipant = activeParticipants[curPlayer];
+                activeParticipants.push(participant);  
+                // After adding a participant, sort the list again
+                SortActiveParticipantList();
+    
+                // End the round when user joins
+                if(previousParticipant === self) {
+                    EndRound();
+                }
+            }
+        } else {
+            if (activeParticipants.includes(participant)) {
+                let curTurnParticipant = activeParticipants[curPlayer];
+                let activeIndex = activeParticipants.indexOf(participant);
+                activeParticipants.splice(activeIndex, 1);
+    
+                // If a player leaves during their turn, go to the next player
+                if(curTurnParticipant === participant) {
+                    curPlayer = (curPlayer + 1) % activeParticipants.length;
+    
+                    if (activeParticipants[curPlayer] === self) {
+                        Patches.inputs.setBoolean('currentPlayer', true);
+                        Patches.inputs.setPulse('enterBalloon', Reactive.once());
+                    } else {
+                        Patches.inputs.setBoolean('currentPlayer', false);
+                    }
+                }
+            }
+        }
+    }
+
+    // Set a random amount of turns before the balloon bursts and sends that value to all callers 
+    function SetBurstAmount() {
+        Patches.inputs.setPulse('resetBalloon', Reactive.once());
+        
+        burstCountdown =  Math.floor(Math.random() * ((maxTurnCount + 1) - minTurnCount)) + minTurnCount;
+        burstAmtChannel.sendMessage({ 'burstNum': burstCountdown }).catch(err => {
+            Diagnostics.log(err);
+        });
+    }
+
+    // Ensure all users have the same turn list by sorting by id
+    function SortActiveParticipantList() {
+        activeParticipants.sort(function(a, b){
+            if (a.id < b.id) {
+                return -1;
+            }
+            if (a.id > b.id) {
+                return 1;
+            }
+        });
+    }
+})();
